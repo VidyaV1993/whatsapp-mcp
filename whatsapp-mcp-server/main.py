@@ -1,4 +1,6 @@
 from typing import List, Dict, Any, Optional
+import json
+import os
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
@@ -245,6 +247,194 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+def _resolve_chat_jid(group_name: str) -> Optional[str]:
+    """Look up a chat JID by partial group name match."""
+    chats = whatsapp_list_chats(query=group_name, limit=5, include_last_message=True)
+    if not chats:
+        return None
+    if isinstance(chats[0], dict):
+        return chats[0].get("jid")
+    return getattr(chats[0], "jid", None)
+
+
+@mcp.tool()
+def extract_trip_itinerary(
+    group_name: str,
+    days_back: int = 30
+) -> str:
+    """Extract a structured trip itinerary from a WhatsApp group chat.
+
+    Scans messages for dates, times, locations, bookings, and plans then
+    returns a clean day-by-day itinerary. Great for girls trip planning groups.
+
+    Args:
+        group_name: Name or partial name of the WhatsApp group (e.g. "girls trip")
+        days_back: How many days back to scan for messages (default: 30)
+    """
+    from datetime import datetime, timedelta
+
+    chat_jid = _resolve_chat_jid(group_name)
+    if not chat_jid:
+        return f"Could not find a group matching '{group_name}'. Try list_chats to see available groups."
+
+    after = (datetime.now() - timedelta(days=days_back)).isoformat()
+    messages = whatsapp_list_messages(
+        chat_jid=chat_jid,
+        after=after,
+        limit=500,
+        include_context=False
+    )
+
+    if not messages or messages.startswith("No messages"):
+        return "No messages found in this chat for the given time period."
+
+    prompt_prefix = (
+        "You are a helpful trip planner assistant. Below are WhatsApp messages from a group trip planning chat.\n"
+        "Extract and organize all trip-related information into a clear, structured itinerary.\n"
+        "Include: dates, times, locations, hotel/accommodation details, activities, restaurant bookings, "
+        "transport plans, and any action items or things to confirm.\n"
+        "If exact dates are missing, make a note. Format as a day-by-day plan where possible.\n\n"
+        "MESSAGES:\n"
+        f"{messages}\n\n"
+        "ITINERARY:"
+    )
+    return prompt_prefix
+
+
+@mcp.tool()
+def extract_packing_list(
+    group_name: str,
+    days_back: int = 30
+) -> str:
+    """Extract a consolidated packing list from a WhatsApp group trip chat.
+
+    Scans messages for things people said they'll bring, items mentioned as
+    needed, and shared supplies. Returns a grouped packing list.
+
+    Args:
+        group_name: Name or partial name of the WhatsApp group (e.g. "girls trip")
+        days_back: How many days back to scan for messages (default: 30)
+    """
+    from datetime import datetime, timedelta
+
+    chat_jid = _resolve_chat_jid(group_name)
+    if not chat_jid:
+        return f"Could not find a group matching '{group_name}'. Try list_chats to see available groups."
+
+    after = (datetime.now() - timedelta(days=days_back)).isoformat()
+    messages = whatsapp_list_messages(
+        chat_jid=chat_jid,
+        after=after,
+        limit=500,
+        include_context=False
+    )
+
+    if not messages or messages.startswith("No messages"):
+        return "No messages found in this chat for the given time period."
+
+    prompt_prefix = (
+        "You are a helpful trip assistant. Below are WhatsApp messages from a group trip planning chat.\n"
+        "Extract and consolidate everything related to packing and what people are bringing.\n"
+        "Look for: 'I'll bring', 'I'm packing', 'don't forget', 'we need', 'who's bringing', "
+        "'reminder to pack', and similar phrases.\n"
+        "Organize into categories: Clothes & Accessories, Toiletries, Tech & Gadgets, "
+        "Food & Drinks, Shared Supplies, Documents & Money, and Other.\n"
+        "For each item note who is bringing it if mentioned, and flag any items where no one "
+        "has volunteered yet.\n\n"
+        "MESSAGES:\n"
+        f"{messages}\n\n"
+        "PACKING LIST:"
+    )
+    return prompt_prefix
+
+
+CHAT_LISTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_lists.json")
+
+
+def _load_chat_lists() -> Dict[str, List[str]]:
+    """Load chat list definitions from chat_lists.json."""
+    if not os.path.exists(CHAT_LISTS_PATH):
+        return {}
+    with open(CHAT_LISTS_PATH, "r") as f:
+        return json.load(f)
+
+
+@mcp.tool()
+def get_list_chats(list_name: str) -> str:
+    """Get all WhatsApp chats and groups belonging to a custom list.
+
+    Lists are defined in chat_lists.json — each list maps to a set of
+    keywords matched against chat names. Similar to WhatsApp's built-in
+    custom lists feature (Family, Work, Dance etc.).
+
+    Args:
+        list_name: Name of the list (e.g. "Dance", "Family", "Neighbors")
+    """
+    import sqlite3 as _sqlite3
+
+    lists = _load_chat_lists()
+
+    if not lists:
+        return "No lists defined. Edit chat_lists.json in the whatsapp-mcp-server folder to create your lists."
+
+    # Case-insensitive match for list name
+    matched_key = next((k for k in lists if k.lower() == list_name.lower()), None)
+    if not matched_key:
+        available = ", ".join(lists.keys())
+        return f"List '{list_name}' not found. Available lists: {available}"
+
+    keywords = lists[matched_key]
+
+    # Query ALL named chats directly from the database (no limit)
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+    try:
+        conn = _sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT c.jid, c.name, c.last_message_time, m.content as last_message
+            FROM chats c
+            LEFT JOIN messages m ON c.jid = m.chat_jid AND c.last_message_time = m.timestamp
+            WHERE c.name != ''
+            ORDER BY c.last_message_time DESC
+        """)
+        all_chats = cursor.fetchall()
+        conn.close()
+    except _sqlite3.Error as e:
+        return f"Database error: {e}"
+
+    matches = [(jid, name, last_time, last_msg) for jid, name, last_time, last_msg in all_chats
+               if any(kw.lower() in (name or '').lower() for kw in keywords)]
+
+    if not matches:
+        return f"No chats found for list '{matched_key}' with keywords: {keywords}\nTry editing chat_lists.json to adjust the keywords."
+
+    lines = [f"📋 {matched_key} ({len(matches)} chats)\n"]
+    for jid, name, last_time, last_msg in matches:
+        preview = (last_msg[:60] + "...") if last_msg and len(last_msg) > 60 else (last_msg or "")
+        lines.append(f"• {name}  [{last_time}]\n  {preview}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def show_all_lists() -> str:
+    """Show all defined custom chat lists and their keyword filters.
+
+    Returns your list names and the keywords used to match chats to each list.
+    Edit chat_lists.json to add, remove or rename lists and keywords.
+    """
+    lists = _load_chat_lists()
+
+    if not lists:
+        return "No lists defined. Edit chat_lists.json in the whatsapp-mcp-server folder to create your lists."
+
+    lines = ["📋 Your Custom Chat Lists\n"]
+    for list_name, keywords in lists.items():
+        lines.append(f"• {list_name}: {', '.join(keywords)}")
+    lines.append(f"\nEdit: {CHAT_LISTS_PATH}")
+    return "\n".join(lines)
+
 
 if __name__ == "__main__":
     # Initialize and run the server
