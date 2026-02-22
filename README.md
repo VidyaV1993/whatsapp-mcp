@@ -6,7 +6,7 @@ Based on [whatsapp-mcp](https://github.com/lharries/whatsapp-mcp), this fork fix
 
 It connects to your **personal WhatsApp account** via the WhatsApp multi-device API using the [whatsmeow](https://github.com/tulir/whatsmeow) library. All messages are stored locally in a SQLite database and only sent to Claude when you explicitly invoke a tool.
 
-![Demo](whatsapp_ai_agent.mp4)
+![WhatsApp AI Agent demo](demo.png)
 
 > ⚠️ **Privacy note:** As with any MCP server that accesses personal data, be mindful of [prompt injection risks](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). Messages are only sent to Claude when you invoke a tool.
 
